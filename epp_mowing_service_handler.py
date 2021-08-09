@@ -18,17 +18,21 @@ import zipfile
 from openpyxl import Workbook, load_workbook
 from os.path import expanduser
 from math import ceil
+import re
+import fnmatch
+import os
 
 
-BUDGET_ACCUMULATOR_NAME = 'Maintenance.DMD'
+BUDGET_ACCUMULATOR_NAME = 'Maintenance.Renew'
 ERRORS = []
 
 def do_everything(status_box, progressbar, **kwargs):
     service_excel = kwargs['service_excel']
-    invoice_excel = kwargs['invoice_excel']
+    invoice_excel = kwargs.get('invoice_excel', None)
     photo_path = kwargs['photo_path']
     output_zip_file = kwargs['output_zip_file']
     output_folder = kwargs['output_folder']
+    budget_accumulator_name = kwargs['maintence_accumulator']
 
     p = Path(photo_path)
 
@@ -85,6 +89,7 @@ def do_everything(status_box, progressbar, **kwargs):
 
 
     for i in range(1, len(attachments_header)):
+        print('{} - attachments_worksheet'.format(i,))
         attachments_worksheet.cell(attachments_worksheet_row_counter, i, value=attachments_header[i])
     attachments_worksheet_row_counter = attachments_worksheet_row_counter + 1
 
@@ -117,39 +122,56 @@ def do_everything(status_box, progressbar, **kwargs):
                 progress = progress + 1
                 progressbar.setValue(progress)
             service_number = service_row[0].value
-            parcel_number = service_row[3].value
+            parcel_number = service_row[3].value # this column can change depending on layout in epp service list view
             for i,row in enumerate(invoice_tab.rows): # look for matching parcels in the inovice spreadsheet
+                invoice_parcel_number = row[0].value # subject to change as ALS changes invoice format
+                invoice_address = row[1].value
+                invoice_date_time = row[3].value
+                invoice_amount = row[4].value
+
                 if i == 0: # Skip header row
                     continue
-                matched = True
-                if str(row[0].value) == str(parcel_number):
+                if str(invoice_parcel_number) == str(parcel_number):
+                    matched = True
+                    print(parcel_number)
                     if parcel_number in already_found:
                         already_found[parcel_number] = already_found[parcel_number] + 1
                         ERRORS.append('Parcel number {} included on invoice {} times'.format(parcel_number,already_found[parcel_number],))
                     else:
                         already_found[parcel_number] = 1
-                    images = list(p.glob('{}*.jpg'.format(row[1].value,)))
-                    if type(row[2].value) == datetime:
-                        date_incurred = row[2].value
+                    if type(invoice_date_time) == datetime:
+                        date_incurred = invoice_date_time
+                    elif invoice_date_time is not None:
+                        date_incurred = datetime.strptime(invoice_date_time, '%m/%-d/%Y %-H:%M')
                     else:
-                        date_incurred = datetime.strptime(row[2].value, '%m/%-d/%Y %-H:%M')
+                        if invoice_amount is not None and invoice_amount > 0:
+                            ERRORS.append('Parcel number {} included on invoice for ${} but without a valid date/time listed.'.format(parcel_number,invoice_amount,))
+
+                    # The problem is that the invoice links the parcel number to the street address
+                    # that we use to find photos. If we don't have an invoice we need ePP street address to match mowing image file name address,
+                    # which it often doesn't do exactly.
+                #    images = list(p.glob('{}*.jpg'.format(row[1].value,)))
+                    rule = re.compile(fnmatch.translate('{}*'.format(invoice_address,)), re.IGNORECASE)
+                #    print('List Dir: {}'.format(os.listdir(photo_path),))
+                    images = [name for name in os.listdir(photo_path) if rule.match(name)]
                     if len(images) == 0:
                         ERRORS.append('Parcel number {} included on invoice has no accompanying images'.format(parcel_number,))
                     for image in images:
+                        print('Image Path - {}'.format(PurePath(photo_path, image),) )
                         attachments_worksheet.cell(attachments_worksheet_row_counter, 1, value=service_number) # Service Number
                         attachments_worksheet.cell(attachments_worksheet_row_counter, 2, value='') # External service number
                         attachments_worksheet.cell(attachments_worksheet_row_counter, 3, value=parcel_number) # Parcel Number
                         attachments_worksheet.cell(attachments_worksheet_row_counter, 4, value='Maintenance') # Service Type
-                        attachments_worksheet.cell(attachments_worksheet_row_counter, 5, value=datetime.fromtimestamp(image.stat().st_mtime).strftime('%c')) # Title from image date
-                        attachments_worksheet.cell(attachments_worksheet_row_counter, 6, value=str(image)) # Attachment Path
+                        attachments_worksheet.cell(attachments_worksheet_row_counter, 5, value=datetime.fromtimestamp(Path(PurePath(photo_path, image)).stat().st_mtime).strftime('%c')) # Title from image date
+                        attachments_worksheet.cell(attachments_worksheet_row_counter, 6, value=str(PurePath(photo_path, image))) # Attachment Path
                         attachments_worksheet_row_counter = attachments_worksheet_row_counter + 1
-                        myzip.write(image)
+                        myzip.write(Path(PurePath(photo_path, image)))
 
                     financials_worksheet.cell(financials_worksheet_row_counter, 1, value=service_number) # Service Number
                     financials_worksheet.cell(financials_worksheet_row_counter, 2, value='') # External System Id
                     financials_worksheet.cell(financials_worksheet_row_counter, 3, value=parcel_number) # Parcel Numbers
-                    financials_worksheet.cell(financials_worksheet_row_counter, 4, value=BUDGET_ACCUMULATOR_NAME) # Budget Accumulator Name
-                    financials_worksheet.cell(financials_worksheet_row_counter, 5, value=row[3].value) # Amount
+                    financials_worksheet.cell(financials_worksheet_row_counter, 4, value=budget_accumulator_name) # Budget Accumulator Name
+                    financials_worksheet.cell(financials_worksheet_row_counter, 5, value=invoice_amount) # Amount
                     financials_worksheet.cell(financials_worksheet_row_counter, 6, value='C') # Amount Indicator - C=cost, I=income
                     financials_worksheet.cell(financials_worksheet_row_counter, 7, value=date_incurred) # Date Incurred
                     financials_worksheet.cell(financials_worksheet_row_counter, 8, value='Auto created') # Comment
@@ -164,19 +186,37 @@ def do_everything(status_box, progressbar, **kwargs):
                     property_detail_worksheet_row_counter = property_detail_worksheet_row_counter + 1
 
             if matched == False:
+                print('matched == False, appending to error {}'.format(parcel_number,))
                 ERRORS.append('Parcel number {} listed in service but not in invoice'.format(parcel_number,))
 
+        invoice_parcel_numbers = [] # Generate list of all parcels in the invoice spreadsheet
+        for i,row in enumerate(invoice_tab.rows):
+            if i == 0: # Skip header row
+                continue
+            invoice_parcel_number = row[0].value # subject to change as ALS changes invoice format
+            invoice_parcel_numbers.append(str(invoice_parcel_number))
+
+        service_parcel_numbers = [] # Generate list of all parcels in the service spreadsheet
+        for j,service_row in enumerate(service_tab.rows):
+            if j == 0: # Skip the header row
+                continue
+            parcel_number = str(service_row[3].value)
+            service_parcel_numbers.append(parcel_number)
+        invoice_not_service_parcels = list(set(invoice_parcel_numbers) - set(service_parcel_numbers)) # calculate the difference
+        for parcel in invoice_not_service_parcels:
+            ERRORS.append('Parcel number {} listed in invoice but not in service'.format(parcel,))
 
         workbook.save(filename=PurePath(output_folder, output_filename) )
         myzip.write( PurePath(output_folder, output_filename), output_filename )
         progressbar.setValue(100)
         status_box.setText('Finished with {} error(s).'.format(len(ERRORS),))
-        status_box.setText('\n'.join(ERRORS))
-        status_box.setText('Saved {} and {}'.format(output_filename,output_zip_file,))
-
+        status_box.append('\n'.join(ERRORS))
+        status_box.append('Saved {} and {}'.format(output_filename,output_zip_file,))
+        print(ERRORS)
 
 import sys
 from PyQt5.QtWidgets import QApplication, QWidget, QInputDialog, QLineEdit, QFileDialog, QPushButton, QLabel, QProgressBar, QTextEdit
+from PyQt5.QtWidgets import QComboBox
 from PyQt5.QtGui import QIcon
 from PyQt5.QtCore import pyqtSlot
 
@@ -231,6 +271,14 @@ class App(QWidget):
         self.output_folder_button_lbl = QLabel(self.output_folder, self)
         self.output_folder_button_lbl.setGeometry(100, 310, 500, 20)
 
+        maintence_accumulator_combo_box = QComboBox(self)
+        maintence_accumulator_combo_box.addItem('Select value')
+        maintence_accumulator_combo_box.addItem('Maintenance.Renew')
+        maintence_accumulator_combo_box.addItem('Maintenance.DMD')
+
+        maintence_accumulator_combo_box.move(100, 350)
+        maintence_accumulator_combo_box.currentTextChanged.connect(self.maintenance_accumulator_onChanged)
+
         self.go_button = QPushButton('Go', self)
         self.go_button.move(400, 100)
         self.go_button.clicked.connect(self.on_click_go)
@@ -242,12 +290,12 @@ class App(QWidget):
 
 
         self.status_box = QTextEdit(self)
-        self.status_box.move(100, 370)
+        self.status_box.move(100, 420)
         self.status_box.resize(400,100)
         self.status_box.setReadOnly(True)
 
         self.progress = QProgressBar(self)
-        self.progress.setGeometry(100, 340, 400, 20)
+        self.progress.setGeometry(100, 390, 410, 20)
 
         self.show()
 
@@ -286,6 +334,10 @@ class App(QWidget):
     def on_click_output_folder(self):
         self.output_folder = self.openFolderDialog(lbl=self.output_folder_button_lbl)
 
+    #@pyqtSlot()
+    def maintenance_accumulator_onChanged(self,text):
+        print(text)
+        self.maintenance_accumulator_value = text
 
     @pyqtSlot()
     def on_click_go(self):
@@ -298,6 +350,7 @@ class App(QWidget):
             photo_path=self.photo_path,
             invoice_excel=self.invoice_excel,
             service_excel=self.service_excel,
+            maintence_accumulator=self.maintenance_accumulator_value,
             )
 
 
